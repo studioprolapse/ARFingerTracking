@@ -9,8 +9,8 @@ final class SessionHandler: NSObject, ObservableObject, ARSessionDelegate {
   private var currentBuffer: CVPixelBuffer?
   private var ringPipView: UIView!
   
-  private lazy var handPoseRequest: VNDetectHumanHandPoseRequest = {
-    let request = VNDetectHumanHandPoseRequest()
+  private lazy var handPoseRequest: DetectHumanHandPoseRequest = {
+    var request = DetectHumanHandPoseRequest()
     request.maximumHandCount = 1
     return request
   }()
@@ -19,7 +19,6 @@ final class SessionHandler: NSObject, ObservableObject, ARSessionDelegate {
     ringPipView = createFingerView(in: view)
   }
   
-  
   func session(_ session: ARSession, didUpdate frame: ARFrame) {
     // Do not enqueue other buffers for processing while another Vision task is still running.
     // The camera stream has only a finite amount of buffers available; holding too many buffers for analysis would starve the camera.
@@ -27,41 +26,38 @@ final class SessionHandler: NSObject, ObservableObject, ARSessionDelegate {
     
     // Retain the image buffer for Vision processing.
     self.currentBuffer = frame.capturedImage
-    classifyFinger()
+    
+    Task {
+      await classifyFinger()
+    }
   }
   
-  func classifyFinger() {
+  func classifyFinger() async {
     guard let currentBuffer = currentBuffer else {
       fatalError("There no buffer available")
     }
     
-    let handler = VNImageRequestHandler(
-      cvPixelBuffer: currentBuffer,
-      orientation: .right,
-      options: [:]
-    )
-    
-    DispatchQueue.global().async { [weak self] in
-      do {
-        try self?.performRequest(handler: handler)
-      } catch {
-        print("Error performing hand pose detection: \(error)")
+    do {
+      // Release the pixel buffer when done, allowing the next buffer to be processed.
+      defer { self.currentBuffer = nil }
+      
+      let observations = try await handPoseRequest.perform(on: currentBuffer, orientation: .right)
+      
+      Task { @MainActor in
+        self.processPoseResults(observations)
       }
+      
+    } catch {
+      print("Error performing hand pose detection: \(error)")
     }
   }
   
-  
-  private func performRequest(handler: VNImageRequestHandler) throws {
-    // Release the pixel buffer when done, allowing the next buffer to be processed.
-    defer { self.currentBuffer = nil }
-    
-    try handler.perform([handPoseRequest])
-    
-    if let observation = handPoseRequest.results?.first as? VNHumanHandPoseObservation {
-      let jointPoints = try observation.recognizedPoints(.all)
-      DispatchQueue.main.async { [weak self] in
-        self?.updateFingerTipPositions(jointPoints)
-      }
+  private func processPoseResults(_ observations: DetectHumanHandPoseRequest.Result) {
+    if let observation = observations.first {
+      
+      let jointPoints = observation.allJoints()
+      self.updateFingerTipPositions(jointPoints)
+      
     } else {
       print("\(Date.now): No hands")
       ringPipView.isHidden = true
@@ -69,24 +65,22 @@ final class SessionHandler: NSObject, ObservableObject, ARSessionDelegate {
   }
   
   private func updateFingerTipPositions(
-    _ jointPoints: [VNHumanHandPoseObservation.JointName: VNRecognizedPoint]
+    _ jointPoints: [HumanHandPoseObservation.PoseJointName : Joint]
   ) {
-    if let jointPoint = jointPoints[.ringPIP] {
-      
-      obtainJointPointAndUpdatePosition(jointPoint, layer: ringPipView)
-      
-      guard let arView else { return }
-      
-      if boxEntity == nil {
-        attachMeshToScene(in: arView)
-      } else {
-        updateBoxPosition(jointPoint)
-      }
+    guard let arView = arView else { return }
+    guard let jointPoint = jointPoints[.ringPIP] else {return}
+    
+    self.obtainJointPointAndUpdatePosition(jointPoint, layer: ringPipView)
+    
+    if boxEntity == nil {
+      attachMeshToScene(in: arView)
+    } else {
+      updateBoxPosition(jointPoint)
     }
   }
   
-  private func obtainJointPointAndUpdatePosition(_ jointPoint: VNRecognizedPoint, layer: UIView) {
-    let screenFingerTipPoint = convertPointFromVision(point: jointPoint.location, frameSize: UIScreen.main.bounds.size)
+  private func obtainJointPointAndUpdatePosition(_ jointPoint: Joint, layer: UIView) {
+    let screenFingerTipPoint = jointPoint.location.toImageCoordinates(UIScreen.main.bounds.size, origin: .upperLeft)
     layer.frame.origin = screenFingerTipPoint
     layer.isHidden = false
   }
@@ -121,18 +115,14 @@ final class SessionHandler: NSObject, ObservableObject, ARSessionDelegate {
     arView.scene.addAnchor(anchorEntity)
   }
   
-  func updateBoxPosition(_ visionPoint: VNRecognizedPoint) {
+  func updateBoxPosition(_ visionPoint: Joint) {
     guard let arView = arView, let boxEntity = boxEntity else { return }
     
     // Convert the Vision point to screen space
-    let screenPoint = convertPointFromVision(
-      point: CGPoint(x: visionPoint.x, y: visionPoint.y),
-      frameSize: arView.frame.size
-    )
+    let screenPoint = visionPoint.location.toImageCoordinates(arView.frame.size, origin: .upperLeft)
     
     // Perform raycast to find the world position
     let raycastResults = arView.raycast(from: screenPoint, allowing: .estimatedPlane, alignment: .any)
-    
     
     // Check if we have a valid raycast result
     guard let result = raycastResults.first else {
@@ -145,9 +135,7 @@ final class SessionHandler: NSObject, ObservableObject, ARSessionDelegate {
     let position : SIMD3<Float> = simd_make_float3(worldTransform.x, worldTransform.y, worldTransform.z)
     
     // Update the model position (for example, if you have a model entity named `boxEntity`)
-    DispatchQueue.main.async {
-      boxEntity.position = position
-    }
+    boxEntity.position = position
   }
 }
 
